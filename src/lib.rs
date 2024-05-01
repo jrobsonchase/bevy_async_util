@@ -1,262 +1,281 @@
-use std::{
-  error::Error,
-  future::Future,
-  marker::PhantomData,
-  pin::Pin,
-  task::{
-    Context,
-    Poll,
-  },
-};
+use std::{future::Future, marker::PhantomData, pin::Pin, task::Context, task::Poll};
 
 use bevy::{
-  core::FrameCount,
-  ecs::system::{
-    Command,
-    EntityCommands,
-  },
-  prelude::*,
+    core::FrameCount,
+    ecs::{
+        schedule::ScheduleLabel,
+        system::{Command, EntityCommands},
+    },
+    prelude::*,
 };
-use futures::{
-  executor::block_on,
-  future::poll_immediate,
-  ready,
-  FutureExt,
+use bevy::{
+    ecs::system::EntityCommand,
+    tasks::{block_on, poll_once, IoTaskPool, Task},
 };
-use tokio::{
-  runtime::Handle,
-  task::JoinHandle,
-};
+use nohup::NoHup;
 
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+pub mod nohup;
 
-#[derive(Default)]
-pub struct AsyncPlugin(Option<Handle>);
+pub struct BoxEntityCommand(Box<dyn FnOnce(Entity, &mut World) + Send + 'static>);
 
-impl AsyncPlugin {
-  pub fn new(handle: Option<Handle>) -> Self {
-    Self(handle)
-  }
+impl EntityCommand for BoxEntityCommand {
+    fn apply(self, id: Entity, world: &mut World) {
+        (self.0)(id, world)
+    }
 }
 
-#[derive(Resource, Deref, DerefMut)]
-pub struct AsyncRuntime(Handle);
-
-struct BoxCommand(Box<dyn FnOnce(&mut World) + Send + 'static>);
-
-impl Command for BoxCommand {
-  fn apply(self, world: &mut World) {
-    (self.0)(world)
-  }
+impl BoxEntityCommand {
+    pub fn new<C: EntityCommand + Send + 'static>(value: C) -> Self {
+        BoxEntityCommand(Box::new(|id, world| value.apply(id, world)))
+    }
 }
 
-impl BoxCommand {
-  fn new<C: Command + Send + 'static>(value: C) -> Self {
-    BoxCommand(Box::new(|world| value.apply(world)))
-  }
+pub trait Callback: Component + Future<Output = Self::Then> + Unpin {
+    type Then: EntityCommand;
 }
 
-type ErrCb = Box<dyn FnOnce(BoxError, Entity, &mut World) + Send + Sync + 'static>;
+impl<T> Callback for T
+where
+    T: Component + Future + Unpin,
+    T::Output: EntityCommand,
+{
+    type Then = T::Output;
+}
 
 #[derive(Component)]
-pub struct Callback(Task<BoxCommand>, Option<ErrCb>);
+pub struct NoHupCallback(NoHup<BoxEntityCommand>);
 
-fn run_callbacks(
-  frame: Res<FrameCount>,
-  cmds: ParallelCommands,
-  mut query: Query<(Entity, &mut Callback)>,
-) {
-  query.iter_mut().for_each(|(entity, mut cb)| {
-    let Callback(task, err_cb) = &mut *cb;
-    let Some(task_result) = check_task(task) else {
-      return;
+impl Future for NoHupCallback {
+    type Output = BoxEntityCommand;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.as_mut().0).poll(cx)
+    }
+}
+
+#[derive(Component)]
+pub struct TaskCallback(Task<BoxEntityCommand>);
+
+impl Future for TaskCallback {
+    type Output = BoxEntityCommand;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.as_mut().0).poll(cx)
+    }
+}
+
+fn run_callback<C>(entity: Entity, cmds: &ParallelCommands, cb: &mut C)
+where
+    C: Callback,
+{
+    let Some(task_result) = check_task(cb) else {
+        return;
     };
-    let err_cb = err_cb.take().expect("Callback can only complete once");
-
-    let frame = frame.0;
 
     cmds.command_scope(move |mut cmds| {
-      if let Some(mut entity_cmds) = cmds.get_entity(entity) {
-        entity_cmds.remove::<Callback>();
-        trace!(frame, ?entity, "running async task callback");
-        match task_result {
-          Ok(cb) => cmds.add(move |world: &mut World| (cb.0)(world)),
-          Err(error) => {
-            cmds.add(move |world: &mut World| err_cb(error, entity, world));
-          }
-        };
-      } else {
-        warn!(?entity, "entity despawned before callbacks could run");
-      }
+        // cmds.entity(entity).add(task_result);
+        cmds.add(move |world: &mut World| {
+            task_result.apply(entity, world);
+        });
     });
-  })
 }
 
-pub struct Task<T> {
-  fut: JoinHandle<Result<T, BoxError>>,
+fn run_callbacks<T: Callback>(cmds: ParallelCommands, mut query: Query<(Entity, &mut T)>) {
+    query.par_iter_mut().for_each(|(entity, mut cb)| {
+        run_callback(entity, &cmds, &mut *cb);
+    })
 }
 
-impl<T> Future for Task<T> {
-  type Output = Result<T, BoxError>;
-
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let res = ready!(self.fut.poll_unpin(cx))?;
-    Poll::Ready(res)
-  }
+fn check_task<F, T>(fut: &mut F) -> Option<T>
+where
+    F: Future<Output = T> + Unpin,
+{
+    block_on(poll_once(fut))
 }
 
-impl<T> Task<T> {
-  #[allow(dead_code)]
-  pub fn check(&mut self) -> Option<Result<T, BoxError>> {
-    check_task(self)
-  }
-}
-
-impl AsyncRuntime {
-  pub fn block_on<F>(&self, fut: F) -> F::Output
-  where
-    F: Future,
-  {
-    self.0.block_on(fut)
-  }
-  pub fn handle(&self) -> Handle {
-    self.0.clone()
-  }
-  pub fn spawn<F, T>(&self, fut: F) -> Task<T>
-  where
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
+fn new_nohup_callback<T>(
+    fut: impl Future<Output = T> + Send + 'static,
+    cb: impl FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+) -> NoHupCallback
+where
     T: Send + 'static,
-  {
-    Task {
-      fut: self.0.spawn(fut),
-    }
-  }
+{
+    let rt = IoTaskPool::get();
+    let task = NoHup::new(rt.spawn(async move {
+        let task_result = fut.await;
+        BoxEntityCommand::new(move |entity, world: &mut World| cb(task_result, entity, world))
+    }));
+    NoHupCallback(task)
 }
 
-impl Plugin for AsyncPlugin {
-  fn build(&self, app: &mut App) {
-    let handle = self.0.clone().unwrap_or_else(|| {
-      tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .handle()
-        .clone()
+fn new_task_callback<T>(
+    fut: impl Future<Output = T> + Send + 'static,
+    cb: impl FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+) -> TaskCallback
+where
+    T: Send + 'static,
+{
+    let rt = IoTaskPool::get();
+    let task = rt.spawn(async move {
+        let task_result = fut.await;
+        BoxEntityCommand::new(move |entity, world: &mut World| cb(task_result, entity, world))
     });
-    app.insert_resource(AsyncRuntime(handle)).add_systems(
-      PreUpdate,
-      run_callbacks.run_if(any_with_component::<Callback>),
-    );
-  }
+    TaskCallback(task)
 }
 
-pub fn check_task<F, T>(fut: &mut F) -> Option<T>
+pub struct SpawnCallback<T, F, O> {
+    fut: F,
+    cb: O,
+    nohup: bool,
+    _ph: PhantomData<fn() -> T>,
+}
+
+impl<T, F, O> Command for SpawnCallback<T, F, O>
 where
-  F: Future<Output = T> + Unpin,
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+    O: FnOnce(T, &mut World) + Send + Sync + 'static,
 {
-  block_on(poll_immediate(fut))
-}
-
-pub struct SpawnCallback<T, F, O, E> {
-  fut: F,
-  cb: O,
-  on_err: E,
-  _ph: PhantomData<fn() -> T>,
-}
-
-impl<T, F, O, E> Command for SpawnCallback<T, F, O, E>
-where
-  T: Send + 'static,
-  F: Future<Output = Result<T, BoxError>> + Send + 'static,
-  O: FnOnce(T, &mut World) + Send + Sync + 'static,
-  E: FnOnce(BoxError, &mut World) + Send + Sync + 'static,
-{
-  fn apply(self, world: &mut World) {
-    world.spawn_empty().attach_callback(
-      self.fut,
-      |v, ent, world| {
-        world.despawn(ent);
-        (self.cb)(v, world)
-      },
-      |e, ent, world| {
-        world.despawn(ent);
-        (self.on_err)(e, world)
-      },
-    );
-  }
+    fn apply(self, world: &mut World) {
+        if self.nohup {
+            let callback = new_nohup_callback(self.fut, |v, ent, world| {
+                world.despawn(ent);
+                (self.cb)(v, world)
+            });
+            world.spawn(callback);
+        } else {
+            let callback = new_task_callback(self.fut, |v, ent, world| {
+                world.despawn(ent);
+                (self.cb)(v, world)
+            });
+            world.spawn(callback);
+        }
+    }
 }
 
 pub trait CommandsExt {
-  fn spawn_callback<T, F, O, E>(&mut self, fut: F, cb: O, on_err: E)
-  where
-    T: Send + 'static,
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
-    O: FnOnce(T, &mut World) + Send + Sync + 'static,
-    E: FnOnce(BoxError, &mut World) + Send + Sync + 'static;
+    fn spawn_callback<T, F, O>(&mut self, fut: F, cb: O)
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, &mut World) + Send + Sync + 'static;
+    fn spawn_nohup_callback<T, F, O>(&mut self, fut: F, cb: O)
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, &mut World) + Send + Sync + 'static;
 }
 
 impl CommandsExt for Commands<'_, '_> {
-  fn spawn_callback<T, F, O, E>(&mut self, fut: F, cb: O, on_err: E)
-  where
-    T: Send + 'static,
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
-    O: FnOnce(T, &mut World) + Send + Sync + 'static,
-    E: FnOnce(BoxError, &mut World) + Send + Sync + 'static,
-  {
-    self.add(SpawnCallback {
-      fut,
-      cb,
-      on_err,
-      _ph: PhantomData,
-    })
-  }
+    fn spawn_nohup_callback<T, F, O>(&mut self, fut: F, cb: O)
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, &mut World) + Send + Sync + 'static,
+    {
+        self.add(SpawnCallback {
+            fut,
+            cb,
+            nohup: true,
+            _ph: PhantomData,
+        })
+    }
+
+    fn spawn_callback<T, F, O>(&mut self, fut: F, cb: O)
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, &mut World) + Send + Sync + 'static,
+    {
+        self.add(SpawnCallback {
+            fut,
+            cb,
+            nohup: false,
+            _ph: PhantomData,
+        })
+    }
 }
 
 pub trait EntityCommandsExt {
-  fn attach_callback<T, F, O, E>(&mut self, fut: F, cb: O, on_err: E) -> &mut Self
-  where
-    T: Send + 'static,
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
-    O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
-    E: FnOnce(BoxError, Entity, &mut World) + Send + Sync + 'static;
+    fn attach_nohup_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static;
+    fn attach_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static;
 }
 
 impl EntityCommandsExt for EntityWorldMut<'_> {
-  fn attach_callback<T, F, O, E>(&mut self, fut: F, cb: O, on_err: E) -> &mut Self
-  where
-    T: Send + 'static,
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
-    O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
-    E: FnOnce(BoxError, Entity, &mut World) + Send + Sync + 'static,
-  {
-    let entity = self.id();
-    let world = self.world();
-    let rt = world.resource::<AsyncRuntime>();
-    let frame = world.resource::<FrameCount>().0;
-    trace!(frame, "spawning async task");
-    let task = rt.spawn(async move {
-      let task_result = fut.await?;
-      trace!(?entity, "async task completed");
-      Ok(BoxCommand::new(move |world: &mut World| {
-        cb(task_result, entity, world)
-      }))
-    });
-    let err_cb = Box::new(on_err);
-    self.insert(Callback(task, Some(err_cb)));
-    self
-  }
+    fn attach_nohup_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+    {
+        trace!(
+            frame = self.world().resource::<FrameCount>().0,
+            "attaching async task"
+        );
+        self.insert(new_nohup_callback(fut, cb));
+        self
+    }
+    fn attach_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+    {
+        trace!(
+            frame = self.world().resource::<FrameCount>().0,
+            "attaching async task"
+        );
+        self.insert(new_task_callback(fut, cb));
+        self
+    }
 }
 
 impl EntityCommandsExt for EntityCommands<'_> {
-  fn attach_callback<T, F, O, E>(&mut self, fut: F, cb: O, on_err: E) -> &mut Self
-  where
-    T: Send + 'static,
-    F: Future<Output = Result<T, BoxError>> + Send + 'static,
-    O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
-    E: FnOnce(BoxError, Entity, &mut World) + Send + Sync + 'static,
-  {
-    self.add(move |mut entity_world: EntityWorldMut| {
-      entity_world.attach_callback(fut, cb, on_err);
-    })
-  }
+    fn attach_nohup_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+    {
+        self.add(move |mut entity: EntityWorldMut| {
+            entity.attach_nohup_callback(fut, cb);
+        })
+    }
+    fn attach_callback<T, F, O>(&mut self, fut: F, cb: O) -> &mut Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+        O: FnOnce(T, Entity, &mut World) + Send + Sync + 'static,
+    {
+        self.add(move |mut entity: EntityWorldMut| {
+            entity.attach_callback(fut, cb);
+        })
+    }
+}
+
+pub struct CallbackPlugin;
+
+impl Plugin for CallbackPlugin {
+    fn build(&self, app: &mut App) {
+        app.register_callback::<TaskCallback>(PreUpdate)
+            .register_callback::<NoHupCallback>(PreUpdate);
+    }
+}
+
+pub trait AppExt {
+    fn register_callback<T: Callback>(&mut self, label: impl ScheduleLabel) -> &mut Self;
+}
+
+impl AppExt for App {
+    fn register_callback<T: Callback>(&mut self, label: impl ScheduleLabel) -> &mut Self {
+        self.add_systems(label, run_callbacks::<T>.run_if(any_with_component::<T>))
+    }
 }
