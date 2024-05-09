@@ -73,8 +73,10 @@ where
     };
 
     cmds.command_scope(move |mut cmds| {
-        // cmds.entity(entity).add(task_result);
         cmds.add(move |world: &mut World| {
+            if let Some(mut entity) = world.get_entity_mut(entity) {
+                entity.remove::<C>();
+            }
             task_result.apply(entity, world);
         });
     });
@@ -270,12 +272,28 @@ impl Plugin for CallbackPlugin {
     }
 }
 
+/// The default system set callback systems are registered in.
+#[derive(SystemSet, Debug, Clone, Copy, Hash, Default, PartialEq, Eq)]
+pub struct CallbackSystem;
+
 pub trait AppExt {
-    fn register_callback<T: Callback>(&mut self, label: impl ScheduleLabel) -> &mut Self;
+    fn register_callback_in_set<T: Callback>(
+        &mut self,
+        label: impl ScheduleLabel,
+        set: impl SystemSet,
+    ) -> &mut Self;
+    fn register_callback<T: Callback>(&mut self, label: impl ScheduleLabel) -> &mut Self {
+        self.register_callback_in_set::<T>(label, CallbackSystem)
+    }
 }
 
 impl AppExt for App {
-    fn register_callback<T: Callback>(&mut self, label: impl ScheduleLabel) -> &mut Self {
-        self.add_systems(label, run_callbacks::<T>.run_if(any_with_component::<T>))
+    fn register_callback_in_set<T: Callback>(
+        &mut self,
+        label: impl ScheduleLabel,
+        set: impl SystemSet,
+    ) -> &mut Self {
+        let system = run_callbacks::<T>.run_if(any_with_component::<T>);
+        self.add_systems(label, system.in_set(set))
     }
 }
